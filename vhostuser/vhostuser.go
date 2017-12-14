@@ -29,17 +29,18 @@ import (
 	"github.com/containernetworking/cni/pkg/ipam"
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
+	"github.com/golang/glog"
 )
 
 const defaultCNIDir = "/var/lib/cni/vhostuser"
 
 // VhostConf type defines a vhost-user configuration
 type VhostConf struct {
-	Vhostname string `json:"vhostname"`  // Vhost Port name
-	VhostMac  string `json:"vhostmac"`   // Vhost port MAC address
-	Ifname    string `json:"ifname"`     // Interface name
-	IfMac     string `json:"ifmac"`      // Interface Mac address
-	Vhosttool string `json:"vhost_tool"` // Scripts for configuration
+	VhostPortName string `json:"vhostportname"` // Vhost Port name
+	VhostPortMac  string `json:"vhostmac"`      // Vhost port MAC address
+	Ifname        string `json:"ifname"`        // Interface name
+	IfMac         string `json:"ifmac"`         // Interface Mac address
+	VhostTool     string `json:"vhost_tool"`    // Scripts for configuration
 }
 
 // NetConf type defines a network interfaces configuration
@@ -65,6 +66,7 @@ func ExecCommand(cmd string, args []string) ([]byte, error) {
 func loadConf(bytes []byte) (*NetConf, error) {
 	n := &NetConf{}
 	if err := json.Unmarshal(bytes, n); err != nil {
+		glog.Errorf("failed to load netconf: %v", err)
 		return nil, fmt.Errorf("failed to load netconf: %v", err)
 	}
 
@@ -81,6 +83,7 @@ func saveVhostConf(conf *NetConf, containerID string) error {
 
 	vhostConfBytes, err := json.Marshal(conf.VhostConf)
 	if err != nil {
+		glog.Errorf("saveVhostConf: error serializing delegate netconf: %v", err)
 		return fmt.Errorf("error serializing delegate netconf: %v", err)
 	}
 
@@ -96,12 +99,15 @@ func (vc *VhostConf) loadVhostConf(conf *NetConf, containerID string) error {
 	sockDir := filepath.Join(conf.CNIDir, containerID)
 	path := filepath.Join(sockDir, fileName)
 
-	if data, err := ioutil.ReadFile(path); err == nil {
-		if err = json.Unmarshal(data, vc); err != nil {
-			return fmt.Errorf("failed to parse VhostConf: %v", err)
-		}
-	} else {
+	data, err := ioutil.ReadFile(path)
+	if err != nil {
+		glog.Errorf("loadVhostConf: Failed to read config: %v", err)
 		return fmt.Errorf("failed to read config: %v", err)
+	}
+
+	if err = json.Unmarshal(data, vc); err != nil {
+		glog.Errorf("loadVhostConf: Failed to parse VhostConf: %v", err)
+		return fmt.Errorf("failed to parse VhostConf: %v", err)
 	}
 
 	return nil
@@ -124,23 +130,32 @@ func createVhostPort(conf *NetConf, containerID string) error {
 
 	sockPath := filepath.Join(sockDir, sockRef)
 
-	// vppctl create vhost socket /tmp/sock0 server
+	// vppctl create vhost socket <socket-path> server
+	cmd := conf.VhostConf.VhostTool
 	args := []string{"create", sockPath}
-	if output, err := ExecCommand(conf.VhostConf.Vhosttool, args); err == nil {
-		vhostName := strings.Replace(string(output), "\n", "", -1)
-
-		args = []string{"getmac", vhostName}
-		if output, err := ExecCommand(conf.VhostConf.Vhosttool, args); err == nil {
-			conf.VhostConf.VhostMac = strings.Replace(string(output), "\n", "", -1)
-		}
-
-		conf.VhostConf.Vhostname = vhostName
-		conf.VhostConf.Ifname = conf.If0name
-		conf.VhostConf.IfMac = generateRandomMacAddress()
-		return saveVhostConf(conf, containerID)
+	output, err := ExecCommand(cmd, args)
+	if err != nil {
+		glog.Errorf("Error EndPointCreate: [%v] [%v] [%v]",
+			cmd, args, err)
+		return err
 	}
 
-	return nil
+	vhostPortName := strings.Replace(string(output), "\n", "", -1)
+
+	// vppctl getmac <vhost interface name>
+	args = []string{"getmac", vhostPortName}
+	if output, err := ExecCommand(cmd, args); err != nil {
+		glog.Errorf("Error EndPointCreate: [%v] [%v] [%v]",
+			cmd, args, err)
+	} else {
+		conf.VhostConf.VhostPortMac = strings.Replace(string(output), "\n", "", -1)
+	}
+
+	conf.VhostConf.VhostPortName = vhostPortName
+	conf.VhostConf.Ifname = conf.If0name
+	conf.VhostConf.IfMac = generateRandomMacAddress()
+
+	return saveVhostConf(conf, containerID)
 }
 
 func destroyVhostPort(conf *NetConf, containerID string) error {
@@ -150,13 +165,16 @@ func destroyVhostPort(conf *NetConf, containerID string) error {
 	}
 
 	//vppctl delete vhost-user VirtualEthernet0/0/0
-	args := []string{"delete", vc.Vhostname}
-	if _, err := ExecCommand(conf.VhostConf.Vhosttool, args); err == nil {
-		path := filepath.Join(conf.CNIDir, containerID)
-		return os.RemoveAll(path)
+	args := []string{"delete", vc.VhostPortName}
+	if _, err := ExecCommand(conf.VhostConf.VhostTool, args); err != nil {
+		glog.Errorf("Error destroyVhostPort: [%v] [%v] [%v]",
+			conf.VhostConf.VhostTool, args, err)
+		return err
 	}
 
-	return nil
+	path := filepath.Join(conf.CNIDir, containerID)
+	return os.RemoveAll(path)
+
 }
 
 const netConfigTemplate = `{
@@ -182,11 +200,11 @@ func generateRandomMacAddress() string {
 
 // SetupContainerNetwork writes the configuration to file
 func SetupContainerNetwork(conf *NetConf, containerID, containerIP string) {
-	args := []string{"config", conf.VhostConf.Vhostname, containerIP, conf.VhostConf.IfMac}
-	ExecCommand(conf.VhostConf.Vhosttool, args)
+	args := []string{"config", conf.VhostConf.VhostPortName, containerIP, conf.VhostConf.IfMac}
+	ExecCommand(conf.VhostConf.VhostTool, args)
 
 	// Write the configuration to file
-	config := fmt.Sprintf(netConfigTemplate, containerIP, conf.VhostConf.IfMac, conf.VhostConf.VhostMac)
+	config := fmt.Sprintf(netConfigTemplate, containerIP, conf.VhostConf.IfMac, conf.VhostConf.VhostPortMac)
 	fileName := fmt.Sprintf("%s-%s-ip4.conf", containerID[:12], conf.If0name)
 	sockDir := filepath.Join(conf.CNIDir, containerID)
 	configFile := filepath.Join(sockDir, fileName)
