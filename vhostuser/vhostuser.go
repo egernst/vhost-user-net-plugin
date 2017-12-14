@@ -33,6 +33,7 @@ import (
 
 const defaultCNIDir = "/var/lib/cni/vhostuser"
 
+// VhostConf type defines a vhost-user configuration
 type VhostConf struct {
 	Vhostname string `json:"vhostname"`  // Vhost Port name
 	VhostMac  string `json:"vhostmac"`   // Vhost port MAC address
@@ -41,6 +42,7 @@ type VhostConf struct {
 	Vhosttool string `json:"vhost_tool"` // Scripts for configuration
 }
 
+// NetConf type defines a network interfaces configuration
 type NetConf struct {
 	types.NetConf
 	VhostConf VhostConf `json:"vhost,omitempty"`
@@ -76,14 +78,17 @@ func loadConf(bytes []byte) (*NetConf, error) {
 // saveVhostConf Save the rendered netconf for cmdDel
 func saveVhostConf(conf *NetConf, containerID string) error {
 	fileName := fmt.Sprintf("%s-%s.json", containerID[:12], conf.If0name)
-	if vhostConfBytes, err := json.Marshal(conf.VhostConf); err == nil {
-		sockDir := filepath.Join(conf.CNIDir, containerID)
-		path := filepath.Join(sockDir, fileName)
 
-		return ioutil.WriteFile(path, vhostConfBytes, 0644)
-	} else {
+	vhostConfBytes, err := json.Marshal(conf.VhostConf)
+	if err != nil {
 		return fmt.Errorf("error serializing delegate netconf: %v", err)
 	}
+
+	sockDir := filepath.Join(conf.CNIDir, containerID)
+	path := filepath.Join(sockDir, fileName)
+
+	return ioutil.WriteFile(path, vhostConfBytes, 0644)
+
 }
 
 func (vc *VhostConf) loadVhostConf(conf *NetConf, containerID string) error {
@@ -131,7 +136,7 @@ func createVhostPort(conf *NetConf, containerID string) error {
 
 		conf.VhostConf.Vhostname = vhostName
 		conf.VhostConf.Ifname = conf.If0name
-		conf.VhostConf.IfMac = GenerateRandomMacAddress()
+		conf.VhostConf.IfMac = generateRandomMacAddress()
 		return saveVhostConf(conf, containerID)
 	}
 
@@ -154,7 +159,7 @@ func destroyVhostPort(conf *NetConf, containerID string) error {
 	return nil
 }
 
-const NET_CONFIG_TEMPLATE = `{
+const netConfigTemplate = `{
 	"ipAddr": "%s/32",
 	"macAddr": "%s",
 	"gateway": "169.254.1.1",
@@ -162,7 +167,7 @@ const NET_CONFIG_TEMPLATE = `{
 }
 `
 
-func GenerateRandomMacAddress() string {
+func generateRandomMacAddress() string {
 	buf := make([]byte, 6)
 	if _, err := rand.Read(buf); err != nil {
 		return ""
@@ -175,13 +180,13 @@ func GenerateRandomMacAddress() string {
 	return macAddr
 }
 
-// SetupContainerNetwork Write the configuration to file
+// SetupContainerNetwork writes the configuration to file
 func SetupContainerNetwork(conf *NetConf, containerID, containerIP string) {
 	args := []string{"config", conf.VhostConf.Vhostname, containerIP, conf.VhostConf.IfMac}
 	ExecCommand(conf.VhostConf.Vhosttool, args)
 
 	// Write the configuration to file
-	config := fmt.Sprintf(NET_CONFIG_TEMPLATE, containerIP, conf.VhostConf.IfMac, conf.VhostConf.VhostMac)
+	config := fmt.Sprintf(netConfigTemplate, containerIP, conf.VhostConf.IfMac, conf.VhostConf.VhostMac)
 	fileName := fmt.Sprintf("%s-%s-ip4.conf", containerID[:12], conf.If0name)
 	sockDir := filepath.Join(conf.CNIDir, containerID)
 	configFile := filepath.Join(sockDir, fileName)
@@ -215,15 +220,17 @@ func cmdAdd(args *skel.CmdArgs) error {
 }
 
 func cmdDel(args *skel.CmdArgs) error {
-	if n, err := loadConf(args.StdinData); err == nil {
-		if err = destroyVhostPort(n, args.ContainerID); err != nil {
-			return err
-		}
 
-		return ipam.ExecDel(n.IPAM.Type, args.StdinData)
-	} else {
+	n, err := loadConf(args.StdinData)
+	if err != nil {
 		return err
 	}
+
+	if err = destroyVhostPort(n, args.ContainerID); err != nil {
+		return err
+	}
+
+	return ipam.ExecDel(n.IPAM.Type, args.StdinData)
 }
 
 func main() {
