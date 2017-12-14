@@ -29,6 +29,7 @@ import (
 	"github.com/containernetworking/cni/pkg/ipam"
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
+	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/golang/glog"
 )
 
@@ -40,6 +41,7 @@ type VhostConf struct {
 	VhostPortMac  string `json:"vhostmac"`      // Vhost port MAC address
 	Ifname        string `json:"ifname"`        // Interface name
 	IfMac         string `json:"ifmac"`         // Interface Mac address
+	IfIP          string `json:"ifip"`          // Interface IP Address
 	VhostTool     string `json:"vhost_tool"`    // Scripts for configuration
 }
 
@@ -113,7 +115,7 @@ func (vc *VhostConf) loadVhostConf(conf *NetConf, containerID string) error {
 	return nil
 }
 
-func createVhostPort(conf *NetConf, containerID string) error {
+func createVhostPort(conf *NetConf, containerID string, netns ns.NetNS) error {
 	s := []string{containerID[:12], conf.If0name}
 	sockRef := strings.Join(s, "-")
 
@@ -135,7 +137,7 @@ func createVhostPort(conf *NetConf, containerID string) error {
 	args := []string{"create", sockPath}
 	output, err := ExecCommand(cmd, args)
 	if err != nil {
-		glog.Errorf("Error EndPointCreate: [%v] [%v] [%v]",
+		glog.Errorf("Error createVhostPort: [%v] [%v] [%v]",
 			cmd, args, err)
 		return err
 	}
@@ -155,10 +157,28 @@ func createVhostPort(conf *NetConf, containerID string) error {
 	conf.VhostConf.Ifname = conf.If0name
 	conf.VhostConf.IfMac = generateRandomMacAddress()
 
+	/* Setup a dummy interface corresponding to the vhost-user network.
+	 * Runtime's like Clear Containers will see this dummy interface as
+	 * a hint that there's a vhost-user socket available to pass to the VM
+	 */
+
+	err = netns.Do(func(_ ns.NetNS) error {
+		cmd := "ip"
+		args := []string{"link", "add", conf.VhostConf.IfIP, "type", "dummy"}
+		if err := exec.Command(cmd, args...).Run(); err != nil {
+			return fmt.Errorf("Error EndPointCreate: [%v] [%v] [%v]",
+				cmd, args, err)
+		}
+		return nil
+	})
+	if err != nil {
+		glog.Errorf("Failed to create link in netns: %v", err)
+		return err
+	}
 	return saveVhostConf(conf, containerID)
 }
 
-func destroyVhostPort(conf *NetConf, containerID string) error {
+func destroyVhostPort(conf *NetConf, containerID string, nsID string) error {
 	vc := &VhostConf{}
 	if err := vc.loadVhostConf(conf, containerID); err != nil {
 		return err
@@ -172,9 +192,32 @@ func destroyVhostPort(conf *NetConf, containerID string) error {
 		return err
 	}
 
+	//delete dummy port from inside the namespace. The name of it is
+	// the actual device's IP:
+	if nsID != "" {
+		netns, err := ns.GetNS(nsID)
+		if err != nil {
+			glog.Errorf("failed to to open netns %q, @v", nsID, err)
+			return fmt.Errorf("failed to open netns: %q, %v", nsID, err)
+		}
+		defer netns.Close()
+
+		err = netns.Do(func(_ ns.NetNS) error {
+			cmd := "ip"
+			args = []string{"link", "del", vc.IfIP}
+			if err := exec.Command(cmd, args...).Run(); err != nil {
+				return fmt.Errorf("Error destroyVhostPort: [%v] [%v] [%v]",
+					cmd, args, err)
+			}
+			return nil
+		})
+		if err != nil {
+			glog.Errorf("failed to delete link in ns: %v", err)
+			return err
+		}
+	}
 	path := filepath.Join(conf.CNIDir, containerID)
 	return os.RemoveAll(path)
-
 }
 
 const netConfigTemplate = `{
@@ -220,8 +263,6 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return result.Print()
 	}
 
-	createVhostPort(n, args.ContainerID)
-
 	// run the IPAM plugin and get back the config to apply
 	result, err = ipam.ExecAdd(n.IPAM.Type, args.StdinData)
 	if err != nil {
@@ -230,6 +271,16 @@ func cmdAdd(args *skel.CmdArgs) error {
 	if result.IP4 == nil {
 		return errors.New("IPAM plugin returned missing IPv4 config")
 	}
+
+	n.VhostConf.IfIP = result.IP4.IP.IP.String()
+
+	netns, err := ns.GetNS(args.Netns)
+	if err != nil {
+		return fmt.Errorf("failed to open netns %q: %v", args.Netns, err)
+	}
+	defer netns.Close()
+
+	createVhostPort(n, args.ContainerID, netns)
 
 	containerIP := result.IP4.IP.IP.String()
 	SetupContainerNetwork(n, args.ContainerID, containerIP)
@@ -244,7 +295,7 @@ func cmdDel(args *skel.CmdArgs) error {
 		return err
 	}
 
-	if err = destroyVhostPort(n, args.ContainerID); err != nil {
+	if err = destroyVhostPort(n, args.ContainerID, args.Netns); err != nil {
 		return err
 	}
 
